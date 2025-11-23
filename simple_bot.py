@@ -123,11 +123,21 @@ class SimpleSchoolBot:
         
         self.conn.commit()
     
-    def safe_message(self, text):
-        """Экранирование HTML-символов в тексте"""
-        if not text:
-            return ""
-        return escape(str(text))
+def safe_message(self, text):
+    """Экранирование HTML-символов, но оставляем наши теги"""
+    if not text:
+        return ""
+    # Экранируем только опасные символы, но не ломаем наши теги
+    text = str(text)
+    # Заменяем наши теги на временные метки
+    text = text.replace('<b>', '___BOLD_OPEN___')
+    text = text.replace('</b>', '___BOLD_CLOSE___')
+    # Экранируем весь текст
+    text = escape(text)
+    # Возвращаем наши теги обратно
+    text = text.replace('___BOLD_OPEN___', '<b>')
+    text = text.replace('___BOLD_CLOSE___', '</b>')
+    return text
     
     def truncate_message(self, text, max_length=MAX_MESSAGE_LENGTH):
         """Обрезка сообщения до максимальной длины"""
@@ -682,21 +692,22 @@ class SimpleSchoolBot:
                       "✏️ Изменить звонок", "👀 Посмотреть все звонки"]:
             self.handle_management_menus(chat_id, username, text)
     
-    def show_users_list(self, chat_id):
-        """Показать список пользователей"""
-        users = self.get_all_users()
-        
-        if not users:
-            self.send_message(chat_id, "❌ Нет зарегистрированных пользователей")
-            return
-        
-        users_text = "👥 <b>Список пользователей</b>\n\n"
-        for user in users:
-            reg_date = user[3].split()[0] if user[3] else "неизвестно"
-            users_text += f"👤 {self.safe_message(user[1])} - {self.safe_message(user[2])} (ID: {user[0]})\n"
-            users_text += f"   📅 Зарегистрирован: {reg_date}\n\n"
-        
-        self.send_message(chat_id, users_text)
+def show_users_list(self, chat_id):
+    """Показать список пользователей"""
+    users = self.get_all_users()
+    
+    if not users:
+        self.send_message(chat_id, "❌ Нет зарегистрированных пользователей")
+        return
+    
+    # ✅ Правильное HTML-форматирование
+    users_text = "👥 <b>Список пользователей</b>\n\n"
+    for user in users:
+        reg_date = user[3].split()[0] if user[3] else "неизвестно"
+        users_text += f"👤 {self.safe_message(user[1])} - {self.safe_message(user[2])} (ID: {user[0]})\n"
+        users_text += f"   📅 Зарегистрирован: {reg_date}\n\n"
+    
+    self.send_message(chat_id, users_text)
     
     def start_delete_user(self, chat_id, username):
         """Начать процесс удаления пользователя"""
@@ -866,28 +877,30 @@ class SimpleSchoolBot:
         if username in self.admin_states:
             del self.admin_states[username]
     
-    def show_statistics(self, chat_id):
-        """Показать статистику"""
-        users = self.get_all_users()
-        total_users = len(users)
-        
-        classes = {}
-        for user in users:
-            class_name = user[2]
-            if class_name in classes:
-                classes[class_name] += 1
-            else:
-                classes[class_name] = 1
-        
-        stats_text = "📊 <b>Статистика бота</b>\n\n"
-        stats_text += f"👥 Всего пользователей: {total_users}\n\n"
-        
-        if classes:
-            stats_text += "<b>Распределение по классам:</b>\n"
-            for class_name, count in sorted(classes.items()):
-                stats_text += f"• {self.safe_message(class_name)}: {count} чел.\n"
-        
-        self.send_message(chat_id, stats_text)
+def show_statistics(self, chat_id):
+    """Показать статистику"""
+    users = self.get_all_users()
+    total_users = len(users)
+    
+    classes = {}
+    for user in users:
+        class_name = user[2]
+        if class_name in classes:
+            classes[class_name] += 1
+        else:
+            classes[class_name] = 1
+    
+    # ✅ Правильное форматирование HTML
+    stats_text = "📊 <b>Статистика бота</b>\n\n"
+    stats_text += f"👥 Всего пользователей: {total_users}\n\n"
+    
+    if classes:
+        stats_text += "<b>Распределение по классам:</b>\n"
+        for class_name, count in sorted(classes.items()):
+            stats_text += f"• {self.safe_message(class_name)}: {count} чел.\n"
+    
+    # ✅ Отправляем с правильным parse_mode
+    self.send_message(chat_id, stats_text)
     
     def handle_registration(self, chat_id, user_id, text):
         """Обработка регистрации"""
