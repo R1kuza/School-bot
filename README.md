@@ -1,5 +1,9 @@
 # 🏫 Школьный бот расписания
 
+![Python](https://img.shields.io/badge/python-3.7+-blue.svg)
+![Security](https://img.shields.io/badge/security-enhanced-green.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 Telegram бот для управления школьным расписанием с функциями администрирования.
 
 ## ✨ Возможности
