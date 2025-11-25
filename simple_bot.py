@@ -441,7 +441,7 @@ class SimpleSchoolBot:
             try:
                 excel_file = pd.ExcelFile(io.BytesIO(file_content))
                 sheet_names = excel_file.sheet_names
-                logger.info(f"Доступные листы в файе: {sheet_names}")
+                logger.info(f"Доступные листы в файле: {sheet_names}")
                 
                 selected_sheet = self._select_sheet(sheet_names, shift)
                 if not selected_sheet:
@@ -568,7 +568,7 @@ class SimpleSchoolBot:
                 
                 end_row = next_day_idx if next_day_idx else len(df)
                 
-                day_lessons = self._parse_day_schedule(df, day_row_idx + 1, end_row, class_columns, shift, day_name)
+                day_lessons = self._parse_day_schedule(df, day_row_idx, end_row, class_columns, shift, day_name)
                 lessons_data.extend(day_lessons)
                 logger.info(f"Для дня {day_name} найдено {len(day_lessons)} уроков")
             
@@ -636,7 +636,7 @@ class SimpleSchoolBot:
     def _parse_day_schedule(self, df, start_row, end_row, class_columns, shift, day_name):
         lessons = []
         
-        # ИСПРАВЛЕНИЕ: Собираем все номера уроков из колонки с номерами
+        # Собираем все номера уроков из колонки с номерами (индекс 1)
         lesson_numbers = {}
         for row_idx in range(start_row, min(end_row, len(df))):
             row = df.iloc[row_idx]
@@ -650,6 +650,7 @@ class SimpleSchoolBot:
                     lesson_num = int(numbers[0])
                     if 1 <= lesson_num <= 10:
                         lesson_numbers[row_idx] = lesson_num
+                        logger.debug(f"Найден номер урока {lesson_num} в строке {row_idx}")
         
         # Обрабатываем строки с уроками
         current_lesson_num = 1
@@ -671,15 +672,20 @@ class SimpleSchoolBot:
             lesson_found_in_row = False
             
             for class_name, col_idx in class_columns.items():
-                if col_idx < len(row) and pd.notna(row[col_idx]):
-                    subject = str(row[col_idx]).strip()
+                # Проверяем колонку с предметом
+                subject_col = col_idx
+                if subject_col < len(row) and pd.notna(row[subject_col]):
+                    subject = str(row[subject_col]).strip()
                     
+                    # Пропускаем пустые значения и названия дней
                     if not subject or subject in ['-', '—', ''] or self._is_day_of_week(subject):
                         continue
                     
+                    # Получаем кабинет из следующей колонки
                     room = ""
-                    if col_idx + 1 < len(row) and pd.notna(row[col_idx + 1]):
-                        room_cell = str(row[col_idx + 1]).strip()
+                    room_col = col_idx + 1
+                    if room_col < len(row) and pd.notna(row[room_col]):
+                        room_cell = str(row[room_col]).strip()
                         if room_cell and not self._is_day_of_week(room_cell):
                             room = room_cell
                     
@@ -1021,6 +1027,8 @@ class SimpleSchoolBot:
         username = user.get("username", "")
         data = callback_query["data"]
         
+        logger.info(f"Callback received: {data} from user {username}")
+        
         if data.startswith("day_"):
             day_code = data[4:]
             day_map = {
@@ -1033,13 +1041,16 @@ class SimpleSchoolBot:
             }
             day_text = day_map.get(day_code, day_code)
             
-            # ИСПРАВЛЕНИЕ: Проверяем, является ли это действием администратора
+            # Проверяем, является ли это действием администратора по редактированию расписания
             if username in self.admin_states and self.admin_states[username].get("action") == "edit_schedule_day":
+                logger.info(f"Admin schedule day selection: {day_text}")
                 self.handle_schedule_day_selection(chat_id, username, day_text)
             else:
+                logger.info(f"User day selection: {day_text}")
                 self.handle_day_selection(chat_id, user_id, day_text)
             
         elif data.startswith("admin_"):
+            logger.info(f"Admin callback: {data}")
             self.handle_admin_callback(chat_id, username, data)
             
         self.answer_callback_query(callback_query["id"])
@@ -1098,6 +1109,7 @@ class SimpleSchoolBot:
     
     def handle_day_selection(self, chat_id, user_id, day_text):
         if user_id not in self.user_states:
+            logger.error(f"User state not found for user {user_id}")
             self.send_message(chat_id, "❌ Ошибка: действие не найдено", self.main_menu_keyboard())
             return
         
@@ -1279,11 +1291,16 @@ class SimpleSchoolBot:
         )
     
     def handle_schedule_day_selection(self, chat_id, username, day_name):
+        logger.info(f"Handling schedule day selection for {username}, day: {day_name}")
+        
         if username not in self.admin_states:
+            logger.error(f"Admin state not found for {username}")
+            self.send_message(chat_id, "❌ Ошибка: действие не найдено", self.admin_menu_inline_keyboard())
             return
         
         class_name = self.admin_states[username].get("class")
         if not class_name:
+            logger.error(f"Class not found in admin state for {username}")
             self.send_message(chat_id, "❌ Ошибка: класс не выбран", self.admin_menu_inline_keyboard())
             return
         
