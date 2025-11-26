@@ -9,6 +9,9 @@ from datetime import datetime
 from html import escape
 from collections import defaultdict
 import io
+import psycopg2
+from urllib.parse import urlparse
+import sys
 
 try:
     from dotenv import load_dotenv
@@ -35,6 +38,76 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class DatabaseManager:
+    def __init__(self):
+        self.conn = None
+        self.db_type = None
+        self.connect()
+    
+    def connect(self):
+        database_url = os.environ.get('DATABASE_URL')
+        
+        if database_url:
+            # PostgreSQL в Railway
+            try:
+                url = urlparse(database_url)
+                self.conn = psycopg2.connect(
+                    database=url.path[1:],
+                    user=url.username,
+                    password=url.password,
+                    host=url.hostname,
+                    port=url.port,
+                    sslmode='require'
+                )
+                self.db_type = 'postgresql'
+                logger.info("✅ Подключение к PostgreSQL установлено")
+            except Exception as e:
+                logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
+                self.fallback_to_sqlite()
+        else:
+            # SQLite для локальной разработки
+            self.fallback_to_sqlite()
+    
+    def fallback_to_sqlite(self):
+        try:
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "school_bot.db")
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.db_type = 'sqlite'
+            logger.info("✅ Используется SQLite база данных")
+        except Exception as e:
+            logger.error(f"❌ Ошибка подключения к SQLite: {e}")
+            raise
+    
+    def execute(self, query, params=None):
+        if self.db_type == 'postgresql':
+            # Заменяем ? на %s для PostgreSQL
+            query = query.replace('?', '%s')
+        
+        cursor = self.conn.cursor()
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            self.conn.commit()
+            return cursor
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Ошибка выполнения запроса: {e}")
+            raise e
+    
+    def fetchone(self, query, params=None):
+        cursor = self.execute(query, params)
+        return cursor.fetchone()
+    
+    def fetchall(self, query, params=None):
+        cursor = self.execute(query, params)
+        return cursor.fetchall()
+    
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
 class RateLimiter:
     def __init__(self, max_requests=MAX_REQUESTS_PER_MINUTE, window=60):
         self.requests = defaultdict(list)
@@ -60,60 +133,70 @@ class SimpleSchoolBot:
         self.user_states = {}
         self.processed_updates = set()
         self.rate_limiter = RateLimiter()
+        self.db = DatabaseManager()
         self.init_db()
     
     def init_db(self):
-        db_path = os.environ.get('DATABASE_PATH', 
-                                os.path.join(os.path.dirname(os.path.abspath(__file__)), "school_bot.db"))
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.create_tables()
     
     def create_tables(self):
-        cursor = self.conn.cursor()
-        cursor.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                full_name TEXT NOT NULL,
-                class TEXT NOT NULL,
-                role TEXT DEFAULT 'user',
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+        try:
+            # Создаем таблицу пользователей
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    class TEXT NOT NULL,
+                    role TEXT DEFAULT 'user',
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             
-            CREATE TABLE IF NOT EXISTS schedule (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                class TEXT NOT NULL,
-                day TEXT NOT NULL,
-                lesson_number INTEGER,
-                subject TEXT,
-                teacher TEXT,
-                room TEXT,
-                UNIQUE(class, day, lesson_number)
-            );
-
-            CREATE TABLE IF NOT EXISTS bell_schedule (
-                lesson_number INTEGER PRIMARY KEY,
-                start_time TEXT NOT NULL,
-                end_time TEXT NOT NULL
-            );
-        """)
-        
-        cursor.execute("SELECT COUNT(*) FROM bell_schedule")
-        if cursor.fetchone()[0] == 0:
-            bell_schedule = [
-                (1, '8:00', '8:40'),
-                (2, '8:50', '9:30'),
-                (3, '9:40', '10:20'),
-                (4, '10:30', '11:10'),
-                (5, '11:25', '12:05'),
-                (6, '12:10', '12:50'),
-                (7, '13:00', '13:40')
-            ]
-            cursor.executemany(
-                "INSERT OR REPLACE INTO bell_schedule (lesson_number, start_time, end_time) VALUES (?, ?, ?)",
-                bell_schedule
-            )
-        
-        self.conn.commit()
+            # Создаем таблицу расписания
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS schedule (
+                    id SERIAL PRIMARY KEY,
+                    class TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    lesson_number INTEGER,
+                    subject TEXT,
+                    teacher TEXT,
+                    room TEXT,
+                    UNIQUE(class, day, lesson_number)
+                )
+            """)
+            
+            # Создаем таблицу звонков
+            self.db.execute("""
+                CREATE TABLE IF NOT EXISTS bell_schedule (
+                    lesson_number INTEGER PRIMARY KEY,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL
+                )
+            """)
+            
+            # Добавляем начальные данные для звонков, если таблица пустая
+            result = self.db.fetchone("SELECT COUNT(*) FROM bell_schedule")
+            if result and result[0] == 0:
+                bell_schedule = [
+                    (1, '8:00', '8:40'),
+                    (2, '8:50', '9:30'),
+                    (3, '9:40', '10:20'),
+                    (4, '10:30', '11:10'),
+                    (5, '11:25', '12:05'),
+                    (6, '12:10', '12:50'),
+                    (7, '13:00', '13:40')
+                ]
+                for bell in bell_schedule:
+                    self.db.execute(
+                        "INSERT INTO bell_schedule (lesson_number, start_time, end_time) VALUES (?, ?, ?) ON CONFLICT (lesson_number) DO NOTHING",
+                        bell
+                    )
+                logger.info("✅ Начальные данные для звонков созданы")
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания таблиц: {e}")
+            raise
     
     def safe_message(self, text):
         if not text:
@@ -141,7 +224,7 @@ class SimpleSchoolBot:
             data["reply_markup"] = reply_markup
         
         try:
-            response = requests.post(url, json=data, timeout=10)
+            response = requests.post(url, json=data, timeout=30)
             return response.json()
         except Exception as e:
             logger.error(f"Ошибка отправки сообщения: {e}")
@@ -153,7 +236,7 @@ class SimpleSchoolBot:
         files = {"document": (filename, document)}
         
         try:
-            response = requests.post(url, data=data, files=files, timeout=30)
+            response = requests.post(url, data=data, files=files, timeout=60)
             return response.json()
         except Exception as e:
             logger.error(f"Ошибка отправки документа: {e}")
@@ -164,7 +247,7 @@ class SimpleSchoolBot:
         data = {"file_id": file_id}
         
         try:
-            response = requests.post(url, json=data, timeout=10)
+            response = requests.post(url, json=data, timeout=30)
             result = response.json()
             if result.get("ok"):
                 return result["result"]
@@ -177,7 +260,7 @@ class SimpleSchoolBot:
         url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
         
         try:
-            response = requests.get(url, timeout=30)
+            response = requests.get(url, timeout=60)
             if response.status_code == 200:
                 return response.content
             return None
@@ -192,12 +275,12 @@ class SimpleSchoolBot:
         url = f"{BASE_URL}/getUpdates"
         params = {
             "offset": self.last_update_id + 1,
-            "timeout": 10,
+            "timeout": 30,  # Увеличили таймаут
             "limit": 100
         }
         
         try:
-            response = requests.get(url, params=params, timeout=15)
+            response = requests.get(url, params=params, timeout=35)  # Увеличили общий таймаут
             result = response.json()
             
             if not result.get("ok") and "Conflict" in str(result.get("description", "")):
@@ -205,6 +288,9 @@ class SimpleSchoolBot:
                 return {"ok": False, "conflict": True}
                 
             return result
+        except requests.exceptions.ReadTimeout:
+            logger.warning("⚠️ Таймаут получения обновлений, продолжаем работу...")
+            return {"ok": False}
         except Exception as e:
             logger.error(f"Ошибка получения обновлений: {e}")
             return {"ok": False}
@@ -213,9 +299,11 @@ class SimpleSchoolBot:
         if not self.is_valid_user_id(user_id):
             return None
             
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone()
+        try:
+            return self.db.fetchone("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        except Exception as e:
+            logger.error(f"Ошибка получения пользователя: {e}")
+            return None
     
     def is_valid_user_id(self, user_id):
         return isinstance(user_id, int) and user_id > 0
@@ -224,63 +312,77 @@ class SimpleSchoolBot:
         if not self.is_valid_user_id(user_id):
             return False
             
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users WHERE class = ?", (class_name,))
-        count = cursor.fetchone()[0]
-        
-        if count >= MAX_USERS_PER_CLASS:
-            self.log_security_event("class_limit_exceeded", user_id, f"Class: {class_name}")
+        try:
+            # Проверяем количество пользователей в классе
+            result = self.db.fetchone("SELECT COUNT(*) FROM users WHERE class = ?", (class_name,))
+            count = result[0] if result else 0
+            
+            if count >= MAX_USERS_PER_CLASS:
+                self.log_security_event("class_limit_exceeded", user_id, f"Class: {class_name}")
+                return False
+            
+            self.db.execute(
+                "INSERT INTO users (user_id, full_name, class) VALUES (?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, class = EXCLUDED.class",
+                (user_id, full_name, class_name)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка создания пользователя: {e}")
             return False
-        
-        cursor.execute(
-            "INSERT OR REPLACE INTO users (user_id, full_name, class) VALUES (?, ?, ?)",
-            (user_id, full_name, class_name)
-        )
-        self.conn.commit()
-        return True
     
     def delete_user(self, user_id):
         if not self.is_valid_user_id(user_id):
             return False
             
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-        self.conn.commit()
-        return cursor.rowcount > 0
+        try:
+            self.db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка удаления пользователя: {e}")
+            return False
     
     def get_all_users(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT user_id, full_name, class, registered_at FROM users ORDER BY registered_at DESC")
-        return cursor.fetchall()
+        try:
+            return self.db.fetchall("SELECT user_id, full_name, class, registered_at FROM users ORDER BY registered_at DESC")
+        except Exception as e:
+            logger.error(f"Ошибка получения пользователей: {e}")
+            return []
     
     def get_schedule(self, class_name, day):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "SELECT lesson_number, subject, teacher, room FROM schedule WHERE class = ? AND day = ? ORDER BY lesson_number",
-            (class_name, day)
-        )
-        return cursor.fetchall()
+        try:
+            return self.db.fetchall(
+                "SELECT lesson_number, subject, teacher, room FROM schedule WHERE class = ? AND day = ? ORDER BY lesson_number",
+                (class_name, day)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка получения расписания: {e}")
+            return []
     
     def save_schedule(self, class_name, day, lessons):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM schedule WHERE class = ? AND day = ?", (class_name, day))
-        
-        for lesson_num, subject, teacher, room in lessons:
-            subject = subject[:100] if subject else ""
-            teacher = teacher[:50] if teacher else ""
-            room = room[:20] if room else ""
+        try:
+            self.db.execute("DELETE FROM schedule WHERE class = ? AND day = ?", (class_name, day))
             
-            cursor.execute(
-                "INSERT OR REPLACE INTO schedule (class, day, lesson_number, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?)",
-                (class_name, day, lesson_num, subject, teacher, room)
-            )
-        
-        self.conn.commit()
+            for lesson_num, subject, teacher, room in lessons:
+                subject = subject[:100] if subject else ""
+                teacher = teacher[:50] if teacher else ""
+                room = room[:20] if room else ""
+                
+                self.db.execute(
+                    "INSERT INTO schedule (class, day, lesson_number, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (class, day, lesson_number) DO UPDATE SET subject = EXCLUDED.subject, teacher = EXCLUDED.teacher, room = EXCLUDED.room",
+                    (class_name, day, lesson_num, subject, teacher, room)
+                )
+            
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения расписания: {e}")
+            return False
     
     def get_bell_schedule(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT lesson_number, start_time, end_time FROM bell_schedule ORDER BY lesson_number")
-        return cursor.fetchall()
+        try:
+            return self.db.fetchall("SELECT lesson_number, start_time, end_time FROM bell_schedule ORDER BY lesson_number")
+        except Exception as e:
+            logger.error(f"Ошибка получения расписания звонков: {e}")
+            return []
     
     def is_admin(self, username):
         return username and username.lower() in [admin.lower() for admin in ADMINS]
@@ -406,28 +508,34 @@ class SimpleSchoolBot:
         return bool(re.match(r'^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$', time_str))
     
     def get_existing_classes(self):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT DISTINCT class FROM users ORDER BY class")
-        return [row[0] for row in cursor.fetchall()]
+        try:
+            result = self.db.fetchall("SELECT DISTINCT class FROM users ORDER BY class")
+            return [row[0] for row in result]
+        except Exception as e:
+            logger.error(f"Ошибка получения классов: {e}")
+            return []
     
     def add_class(self, class_name):
         return self.is_valid_class(class_name)
     
     def delete_class(self, class_name):
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM users WHERE class = ?", (class_name,))
-        deleted_count = cursor.rowcount
-        self.conn.commit()
-        return deleted_count > 0
+        try:
+            self.db.execute("DELETE FROM users WHERE class = ?", (class_name,))
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка удаления класса: {e}")
+            return False
     
     def update_bell_schedule(self, lesson_number, start_time, end_time):
-        cursor = self.conn.cursor()
-        cursor.execute(
-            "UPDATE bell_schedule SET start_time = ?, end_time = ? WHERE lesson_number = ?",
-            (start_time, end_time, lesson_number)
-        )
-        self.conn.commit()
-        return cursor.rowcount > 0
+        try:
+            self.db.execute(
+                "UPDATE bell_schedule SET start_time = ?, end_time = ? WHERE lesson_number = ?",
+                (start_time, end_time, lesson_number)
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления расписания звонков: {e}")
+            return False
 
     def parse_excel_schedule(self, file_content, shift):
         try:
@@ -751,14 +859,13 @@ class SimpleSchoolBot:
             if not lessons_data:
                 return False, f"Не удалось распарсить Excel файл для {shift} смены"
             
-            cursor = self.conn.cursor()
             imported_count = 0
             error_count = 0
             
             imported_classes = set(lesson['class'] for lesson in lessons_data)
             
             for class_name in imported_classes:
-                cursor.execute("DELETE FROM schedule WHERE class = ?", (class_name,))
+                self.db.execute("DELETE FROM schedule WHERE class = ?", (class_name,))
                 logger.info(f"Удалены старые уроки для класса {class_name}")
             
             for lesson in lessons_data:
@@ -767,16 +874,14 @@ class SimpleSchoolBot:
                     class_name = lesson['class']
                     day = lesson['day']
                     
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO schedule (class, day, lesson_number, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?)",
+                    self.db.execute(
+                        "INSERT INTO schedule (class, day, lesson_number, subject, teacher, room) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (class, day, lesson_number) DO UPDATE SET subject = EXCLUDED.subject, teacher = EXCLUDED.teacher, room = EXCLUDED.room",
                         (class_name, day, lesson_number, lesson['subject'], lesson['teacher'], lesson['room'])
                     )
                     imported_count += 1
                 except Exception as e:
                     logger.error(f"Ошибка импорта урока {lesson}: {e}")
                     error_count += 1
-            
-            self.conn.commit()
             
             message = f"✅ Успешно импортировано {imported_count} уроков для {shift} смены\nМетод: method3 (структурный)"
             if error_count > 0:
