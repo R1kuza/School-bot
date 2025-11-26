@@ -120,6 +120,7 @@ class DatabaseManager:
                     full_name TEXT NOT NULL,
                     class TEXT NOT NULL,
                     role TEXT DEFAULT 'user',
+                    username TEXT,
                     registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -162,7 +163,7 @@ class DatabaseManager:
             self.execute("""
                 CREATE TABLE IF NOT EXISTS user_roles (
                     user_id BIGINT PRIMARY KEY,
-                    role_type TEXT NOT NULL CHECK(role_type IN ('guest', 'student', 'teacher')),
+                    role_type TEXT NOT NULL CHECK(role_type IN ('guest', 'student', 'teacher', 'user')),
                     additional_info TEXT,
                     registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(user_id)
@@ -363,8 +364,8 @@ class SimpleSchoolBot:
         )
     
     # НОВЫЕ ФУНКЦИИ - РЕГИСТРАЦИЯ ПО РОЛЯМ
-    def register_user_with_role(self, user_id, full_name, class_name, role_type, additional_info=None):
-        if not self.create_user(user_id, full_name, class_name):
+    def register_user_with_role(self, user_id, full_name, class_name, role_type, additional_info=None, username=None):
+        if not self.create_user(user_id, full_name, class_name, username):
             return False
         
         self.db.execute(
@@ -381,7 +382,7 @@ class SimpleSchoolBot:
             "SELECT role_type, additional_info FROM user_roles WHERE user_id = ?",
             (user_id,)
         )
-        return result if result else ('guest', None)
+        return result if result else ('user', None)
     
     # НОВЫЕ ФУНКЦИИ - ШКОЛЬНЫЕ НОВОСТИ
     def add_news(self, title, content, author, target_audience="all"):
@@ -726,11 +727,19 @@ class SimpleSchoolBot:
         except Exception as e:
             logger.error(f"Ошибка получения пользователя: {e}")
             return None
+
+    def find_user_by_username(self, username):
+        """Поиск пользователя по username"""
+        try:
+            return self.db.fetchone("SELECT * FROM users WHERE username = ?", (username,))
+        except Exception as e:
+            logger.error(f"Ошибка поиска пользователя по username: {e}")
+            return None
     
     def is_valid_user_id(self, user_id):
         return isinstance(user_id, int) and user_id > 0
     
-    def create_user(self, user_id, full_name, class_name):
+    def create_user(self, user_id, full_name, class_name, username=None):
         if not self.is_valid_user_id(user_id):
             return False
             
@@ -743,8 +752,8 @@ class SimpleSchoolBot:
                 return False
             
             self.db.execute(
-                "INSERT INTO users (user_id, full_name, class) VALUES (?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, class = EXCLUDED.class",
-                (user_id, full_name, class_name)
+                "INSERT INTO users (user_id, full_name, class, username) VALUES (?, ?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET full_name = EXCLUDED.full_name, class = EXCLUDED.class, username = EXCLUDED.username",
+                (user_id, full_name, class_name, username)
             )
             return True
         except Exception as e:
@@ -761,10 +770,19 @@ class SimpleSchoolBot:
         except Exception as e:
             logger.error(f"Ошибка удаления пользователя: {e}")
             return False
+
+    def delete_user_by_username(self, username):
+        """Удаление пользователя по username"""
+        try:
+            self.db.execute("DELETE FROM users WHERE username = ?", (username,))
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка удаления пользователя по username: {e}")
+            return False
     
     def get_all_users(self):
         try:
-            return self.db.fetchall("SELECT user_id, full_name, class, registered_at FROM users ORDER BY registered_at DESC")
+            return self.db.fetchall("SELECT user_id, full_name, class, username, registered_at FROM users ORDER BY registered_at DESC")
         except Exception as e:
             logger.error(f"Ошибка получения пользователей: {e}")
             return []
@@ -837,7 +855,7 @@ class SimpleSchoolBot:
         return {
             "keyboard": [
                 [{"text": "👨‍🎓 Ученик"}, {"text": "👨‍🏫 Учитель"}],
-                [{"text": "👤 Гость"}, {"text": "⬅️ Назад"}]
+                [{"text": "👤 Гость"}]
             ],
             "resize_keyboard": True
         }
@@ -1383,21 +1401,19 @@ class SimpleSchoolBot:
                 f"Ты уже зарегистрирован в системе.\n"
                 f"Твой класс: {self.safe_message(user_data[2])}"
             )
+            self.send_message(chat_id, text, self.main_menu_keyboard())
         else:
-            text = (
-                f"Привет, {self.safe_message(user.get('first_name', 'друг'))}!\n"
-                "Я бот для просмотра расписания школы.\n\n"
-                "Для начала работы необходимо зарегистрироваться.\n"
-                "Пожалуйста, введите своё ФИО и класс в формате:\n"
-                "<b>Фамилия Имя Отчество, Класс</b>\n\n"
-                "Например: <i>Иванов Иван Иванович, 10П</i>\n\n"
-                "<b>Доступные классы:</b>\n"
-                "5-9 классы: А, Б, В\n"
-                "10 класс: П, Р\n"
-                "11 класс: Р"
-            )
-        
-        self.send_message(chat_id, text, self.main_menu_keyboard() if user_data else None)
+            self.handle_role_selection(chat_id, user["id"])
+    
+    def handle_role_selection(self, chat_id, user_id):
+        """Обработка выбора роли при регистрации"""
+        self.user_states[user_id] = {"action": "role_selection"}
+        self.send_message(
+            chat_id,
+            "👋 <b>Добро пожаловать!</b>\n\n"
+            "Пожалуйста, выберите вашу роль:",
+            self.role_selection_keyboard()
+        )
     
     def handle_help(self, chat_id, username):
         text = (
@@ -1416,12 +1432,7 @@ class SimpleSchoolBot:
             "• <b>Моё расписание</b> - расписание для твоего класса\n"
             "• <b>Общее расписание</b> - расписание для любого класса\n"
             "• <b>Звонки</b> - расписание звонков\n\n"
-            "Для регистрации введи своё ФИО и класс в формате:\n"
-            "<i>Фамилия Имя Отчество, Класс</i>\n\n"
-            "<b>Доступные классы:</b>\n"
-            "5-9 классы: А, Б, В\n"
-            "10 класс: П, Р\n"
-            "11 класс: Р\n\n"
+            "Для регистрации выберите вашу роль из меню.\n\n"
             "🛠 <b>Техническая помощь</b>\n"
             "Если вы обнаружили ошибку или у вас есть предложения, "
             "напишите разработчику: @r1kuza"
@@ -1564,7 +1575,7 @@ class SimpleSchoolBot:
             if not user_data:
                 self.send_message(
                     chat_id,
-                    "❌ Вы не зарегистрированы. Пожалуйста, введите своё ФИО и класс для регистрации."
+                    "❌ Вы не зарегистрированы. Пожалуйста, выберите роль для регистрации."
                 )
                 return
             
@@ -1715,7 +1726,12 @@ class SimpleSchoolBot:
         if role_type == "guest":
             self.send_message(chat_id, "Введите ваше ФИО:", self.cancel_keyboard())
         else:
-            self.send_message(chat_id, "Введите ваше ФИО и класс в формате: Фамилия Имя Отчество, Класс", self.cancel_keyboard())
+            self.send_message(
+                chat_id, 
+                "Введите ваше ФИО и класс в формате:\n<b>Фамилия Имя Отчество, Класс</b>\n\n"
+                "Например: <i>Иванов Иван Иванович, 10П</i>",
+                self.cancel_keyboard()
+            )
     
     # ОБНОВЛЕННЫЙ ОБРАБОТЧИК CALLBACK
     def handle_callback_query(self, update):
@@ -1974,6 +1990,16 @@ class SimpleSchoolBot:
         
         self.send_message(chat_id, text, self.diary_keyboard())
 
+    def get_user_role_display(self, role_type):
+        """Получение отображаемого названия роли"""
+        role_translations = {
+            'student': 'Ученик',
+            'teacher': 'Учитель', 
+            'guest': 'Гость',
+            'user': 'Пользователь'
+        }
+        return role_translations.get(role_type, role_type)
+
     def show_detailed_statistics(self, chat_id, user_id):
         stats = self.get_user_statistics(user_id)
         achievements = self.get_user_achievements(user_id)
@@ -1981,12 +2007,13 @@ class SimpleSchoolBot:
         
         role_data = self.get_user_role(user_id)
         role_type, additional_info = role_data
+        role_display = self.get_user_role_display(role_type)
         
         text = (f"📈 <b>Подробная статистика</b>\n\n"
                f"👤 <b>Профиль</b>\n"
                f"• Имя: {self.safe_message(user_data[1]) if user_data else 'Неизвестно'}\n"
                f"• Класс: {self.safe_message(user_data[2]) if user_data else 'Неизвестно'}\n"
-               f"• Роль: {role_type}\n\n"
+               f"• Роль: {role_display}\n\n"
                
                f"📊 <b>Активность</b>\n"
                f"• Всего действий: {stats['total_actions']}\n"
@@ -2002,6 +2029,99 @@ class SimpleSchoolBot:
         
         self.send_message(chat_id, text, self.statistics_keyboard())
     
+    # ОБНОВЛЕННЫЕ МЕТОДЫ ДЛЯ УДАЛЕНИЯ ПОЛЬЗОВАТЕЛЕЙ
+    def start_delete_user(self, chat_id, username):
+        """Начало процесса удаления пользователя"""
+        self.admin_states[username] = {"action": "delete_user"}
+        self.send_message(
+            chat_id,
+            "Введите ID пользователя или username для удаления:\n\n"
+            "ID можно узнать через команду '👥 Список пользователей'\n"
+            "Username должен начинаться с @",
+            self.cancel_keyboard()
+        )
+
+    def delete_user_by_identifier(self, chat_id, admin_username, identifier):
+        """Удаление пользователя по ID или username"""
+        try:
+            # Пробуем удалить по ID
+            if identifier.isdigit():
+                user_id = int(identifier)
+                if self.delete_user(user_id):
+                    self.log_security_event("user_deleted", admin_username, f"Deleted user: {user_id}")
+                    self.send_message(chat_id, f"✅ Пользователь с ID {user_id} удален", self.admin_menu_inline_keyboard())
+                else:
+                    self.send_message(chat_id, f"❌ Пользователь с ID {identifier} не найден", self.admin_menu_inline_keyboard())
+            # Удаляем по username
+            elif identifier.startswith('@'):
+                username = identifier[1:]  # Убираем @
+                if self.delete_user_by_username(username):
+                    self.log_security_event("user_deleted", admin_username, f"Deleted user by username: {username}")
+                    self.send_message(chat_id, f"✅ Пользователь с username @{username} удален", self.admin_menu_inline_keyboard())
+                else:
+                    self.send_message(chat_id, f"❌ Пользователь с username @{username} не найден", self.admin_menu_inline_keyboard())
+            else:
+                self.send_message(chat_id, "❌ Неверный формат. Введите ID (число) или username (начинается с @)", self.admin_menu_inline_keyboard())
+        
+        except ValueError:
+            self.send_message(chat_id, "❌ Неверный формат ID", self.admin_menu_inline_keyboard())
+        
+        if admin_username in self.admin_states:
+            del self.admin_states[admin_username]
+
+    def handle_role_registration_input(self, chat_id, user_id, username, text):
+        """Обработка ввода данных для регистрации по роли"""
+        if user_id not in self.user_states or self.user_states[user_id].get("action") != "role_registration":
+            return
+        
+        role_type = self.user_states[user_id].get("role")
+        telegram_username = username  # username из Telegram
+        
+        if role_type == "guest":
+            if not self.is_valid_fullname(text):
+                self.send_message(chat_id, "❌ Неверный формат ФИО. Введите корректное ФИО:")
+                return
+            
+            if self.register_user_with_role(user_id, text, "Гость", "guest", None, telegram_username):
+                self.send_message(chat_id, f"✅ Регистрация гостя прошла успешно!\nФИО: {self.safe_message(text)}", self.main_menu_keyboard())
+            else:
+                self.send_message(chat_id, "❌ Ошибка регистрации", self.main_menu_keyboard())
+        
+        else:
+            parts = text.split(',')
+            if len(parts) != 2:
+                self.send_message(chat_id, "❌ Неверный формат. Введите: Фамилия Имя Отчество, Класс")
+                return
+            
+            full_name = parts[0].strip()
+            class_name = parts[1].strip()
+            
+            if not self.is_valid_fullname(full_name):
+                self.send_message(chat_id, "❌ Неверный формат ФИО")
+                return
+            
+            if not self.is_valid_class(class_name):
+                self.send_message(chat_id, "❌ Неверный формат класса")
+                return
+            
+            class_name = class_name.upper()
+            additional_info = f"Учитель предмета" if role_type == "teacher" else None
+            
+            if self.register_user_with_role(user_id, full_name, class_name, role_type, additional_info, telegram_username):
+                role_text = "учителя" if role_type == "teacher" else "ученика"
+                self.send_message(
+                    chat_id, 
+                    f"✅ Регистрация {role_text} прошла успешно!\n"
+                    f"ФИО: {self.safe_message(full_name)}\n"
+                    f"Класс: {class_name}", 
+                    self.main_menu_keyboard()
+                )
+            else:
+                self.send_message(chat_id, f"❌ Не удалось зарегистрироваться", self.main_menu_keyboard())
+        
+        if user_id in self.user_states:
+            del self.user_states[user_id]
+
     # СУЩЕСТВУЮЩИЕ МЕТОДЫ ОБРАБОТКИ
     def answer_callback_query(self, callback_query_id, text=None):
         url = f"{BASE_URL}/answerCallbackQuery"
@@ -2143,39 +2263,14 @@ class SimpleSchoolBot:
         
         users_text = "👥 <b>Список пользователей</b>\n\n"
         for user in users:
-            reg_date_str = self.format_date(user[3])
+            reg_date_str = self.format_date(user[4])
+            username_display = f" (@{user[3]})" if user[3] else ""
                 
-            users_text += f"👤 {self.safe_message(user[1])} - {self.safe_message(user[2])} (ID: {user[0]})\n"
+            users_text += f"👤 {self.safe_message(user[1])}{username_display}\n"
+            users_text += f"   Класс: {self.safe_message(user[2])} | ID: {user[0]}\n"
             users_text += f"   📅 Зарегистрирован: {reg_date_str}\n\n"
         
         self.send_message(chat_id, users_text, self.admin_menu_inline_keyboard())
-    
-    def start_delete_user(self, chat_id, username):
-        self.admin_states[username] = {"action": "delete_user"}
-        self.send_message(
-            chat_id,
-            "Введите ID пользователя для удаления:\n\n"
-            "ID можно узнать через команду '👥 Список пользователей'",
-            self.cancel_keyboard()
-        )
-    
-    def delete_user_by_id(self, chat_id, admin_username, user_id_str):
-        try:
-            user_id = int(user_id_str)
-            if not self.is_valid_user_id(user_id):
-                self.send_message(chat_id, "❌ Неверный формат ID пользователя", self.admin_menu_inline_keyboard())
-                return
-                
-            if self.delete_user(user_id):
-                self.log_security_event("user_deleted", admin_username, f"Deleted user: {user_id}")
-                self.send_message(chat_id, f"✅ Пользователь с ID {user_id} удален", self.admin_menu_inline_keyboard())
-            else:
-                self.send_message(chat_id, f"❌ Пользователь с ID {user_id} не найден", self.admin_menu_inline_keyboard())
-        except ValueError:
-            self.send_message(chat_id, "❌ Неверный формат ID. ID должен быть числом", self.admin_menu_inline_keyboard())
-        
-        if admin_username in self.admin_states:
-            del self.admin_states[admin_username]
     
     def start_edit_schedule(self, chat_id, username):
         self.admin_states[username] = {"action": "edit_schedule_class"}
@@ -2339,64 +2434,6 @@ class SimpleSchoolBot:
         
         self.send_message(chat_id, stats_text, self.admin_menu_inline_keyboard())
     
-    def handle_registration(self, chat_id, user_id, text):
-        if self.get_user(user_id):
-            self.send_message(chat_id, "Вы уже зарегистрированы!", self.main_menu_keyboard())
-            return
-        
-        parts = text.split(',')
-        if len(parts) != 2:
-            self.send_message(
-                chat_id,
-                "❌ Неверный формат. Пожалуйста, введите данные в формате:\n"
-                "<b>Фамилия Имя Отчество, Класс</b>\n\n"
-                "Например: <i>Иванов Иван Иванович, 10П</i>\n\n"
-                "<b>Доступные классы:</b>\n"
-                "5-9 классы: А, Б, В\n"
-                "10 класс: П, Р\n"
-                "11 класс: Р"
-            )
-            return
-        
-        full_name = parts[0].strip()
-        class_name = parts[1].strip()
-        
-        if not self.is_valid_fullname(full_name):
-            self.send_message(
-                chat_id,
-                "❌ Неверный формат ФИО. ФИО должно содержать как минимум 2 слова, "
-                "состоять только из букв и каждое слово должно быть от 2 до 20 символов."
-            )
-            return
-        
-        if not self.is_valid_class(class_name):
-            self.send_message(
-                chat_id,
-                "❌ Неверный формат класса.\n\n"
-                "<b>Доступные классы:</b>\n"
-                "5-9 классы: А, Б, В\n"
-                "10 класс: П, Р\n"
-                "11 класс: Р\n\n"
-                "Пример: 5А, 10П, 11Р"
-            )
-            return
-        
-        class_name = class_name.upper()
-        if self.create_user(user_id, full_name, class_name):
-            self.send_message(
-                chat_id,
-                f"✅ Регистрация прошла успешно!\nФИО: {self.safe_message(full_name)}\nКласс: {class_name}",
-                self.main_menu_keyboard()
-            )
-            self.log_user_activity(user_id, "registration")
-            self.check_achievements(user_id, "registration")
-        else:
-            self.send_message(
-                chat_id,
-                f"❌ Не удалось зарегистрироваться. Возможно, достигнут лимит пользователей в классе {class_name}.",
-                self.main_menu_keyboard()
-            )
-    
     def process_update(self, update):
         update_id = update.get("update_id")
         
@@ -2472,6 +2509,7 @@ class SimpleSchoolBot:
                         self.send_message(chat_id, "Действие отменено", self.main_menu_keyboard())
                         return
                     
+                    # Обработка админских состояний
                     if username in self.admin_states:
                         state = self.admin_states[username]
                         
@@ -2484,7 +2522,7 @@ class SimpleSchoolBot:
                             return
                         
                         if state.get("action") == "delete_user":
-                            self.delete_user_by_id(chat_id, username, text)
+                            self.delete_user_by_identifier(chat_id, username, text)
                             return
                         elif state.get("action") == "edit_schedule_input":
                             self.handle_schedule_input(chat_id, username, text)
@@ -2502,6 +2540,14 @@ class SimpleSchoolBot:
                             self.handle_role_registration_input(chat_id, user_id, username, text)
                             return
                     
+                    # Обработка пользовательских состояний
+                    if user_id in self.user_states:
+                        state = self.user_states[user_id]
+                        if state.get("action") == "role_registration":
+                            self.handle_role_registration_input(chat_id, user_id, username, text)
+                            return
+                    
+                    # Обработка команд
                     if text.startswith("/start"):
                         self.handle_start(chat_id, user)
                     elif text.startswith("/help"):
@@ -2521,63 +2567,69 @@ class SimpleSchoolBot:
                     elif text == "⬅️ Назад" or self.is_valid_class(text):
                         self.handle_main_menu(chat_id, user_id, text, username)
                     else:
-                        if user_id in self.user_states and self.user_states[user_id].get("action") == "role_registration":
-                            self.handle_role_registration_input(chat_id, user_id, username, text)
+                        # Если пользователь не зарегистрирован, предлагаем выбрать роль
+                        if not self.get_user(user_id):
+                            self.handle_role_selection(chat_id, user_id)
                         else:
-                            self.handle_registration(chat_id, user_id, text)
+                            # Старая регистрация для обратной совместимости
+                            self.handle_legacy_registration(chat_id, user_id, text)
         
         except Exception as e:
             logger.error(f"Ошибка в process_update: {e}")
             import traceback
             logger.error(traceback.format_exc())
     
-    def handle_role_registration_input(self, chat_id, user_id, username, text):
-        if user_id not in self.user_states or self.user_states[user_id].get("action") != "role_registration":
+    def handle_legacy_registration(self, chat_id, user_id, text):
+        """Обработка старого формата регистрации для обратной совместимости"""
+        parts = text.split(',')
+        if len(parts) != 2:
+            self.send_message(
+                chat_id,
+                "❌ Неверный формат. Пожалуйста, выберите роль из меню или введите данные в формате:\n"
+                "<b>Фамилия Имя Отчество, Класс</b>\n\n"
+                "Например: <i>Иванов Иван Иванович, 10П</i>"
+            )
             return
         
-        role_type = self.user_states[user_id].get("role")
+        full_name = parts[0].strip()
+        class_name = parts[1].strip()
         
-        if role_type == "guest":
-            if not self.is_valid_fullname(text):
-                self.send_message(chat_id, "❌ Неверный формат ФИО. Введите корректное ФИО:")
-                return
-            
-            if self.register_user_with_role(user_id, text, "Гость", "guest"):
-                self.send_message(chat_id, f"✅ Регистрация гостя прошла успешно!\nФИО: {self.safe_message(text)}", self.main_menu_keyboard())
-            else:
-                self.send_message(chat_id, "❌ Ошибка регистрации", self.main_menu_keyboard())
+        if not self.is_valid_fullname(full_name):
+            self.send_message(
+                chat_id,
+                "❌ Неверный формат ФИО. ФИО должно содержать как минимум 2 слова, "
+                "состоять только из букв и каждое слово должно быть от 2 до 20 символов."
+            )
+            return
         
+        if not self.is_valid_class(class_name):
+            self.send_message(
+                chat_id,
+                "❌ Неверный формат класса.\n\n"
+                "<b>Доступные классы:</b>\n"
+                "5-9 классы: А, Б, В\n"
+                "10 класс: П, Р\n"
+                "11 класс: Р\n\n"
+                "Пример: 5А, 10П, 11Р"
+            )
+            return
+        
+        class_name = class_name.upper()
+        if self.register_user_with_role(user_id, full_name, class_name, "student"):
+            self.send_message(
+                chat_id,
+                f"✅ Регистрация прошла успешно!\nФИО: {self.safe_message(full_name)}\nКласс: {class_name}\nРоль: Ученик",
+                self.main_menu_keyboard()
+            )
         else:
-            parts = text.split(',')
-            if len(parts) != 2:
-                self.send_message(chat_id, "❌ Неверный формат. Введите: Фамилия Имя Отчество, Класс")
-                return
-            
-            full_name = parts[0].strip()
-            class_name = parts[1].strip()
-            
-            if not self.is_valid_fullname(full_name):
-                self.send_message(chat_id, "❌ Неверный формат ФИО")
-                return
-            
-            if not self.is_valid_class(class_name):
-                self.send_message(chat_id, "❌ Неверный формат класса")
-                return
-            
-            class_name = class_name.upper()
-            additional_info = f"Учитель предмета" if role_type == "teacher" else None
-            
-            if self.register_user_with_role(user_id, full_name, class_name, role_type, additional_info):
-                role_text = "учителя" if role_type == "teacher" else "ученика"
-                self.send_message(chat_id, f"✅ Регистрация {role_text} прошла успешно!\nФИО: {self.safe_message(full_name)}\nКласс: {class_name}", self.main_menu_keyboard())
-            else:
-                self.send_message(chat_id, f"❌ Не удалось зарегистрироваться", self.main_menu_keyboard())
-        
-        if user_id in self.user_states:
-            del self.user_states[user_id]
-    
+            self.send_message(
+                chat_id,
+                f"❌ Не удалось зарегистрироваться. Возможно, достигнут лимит пользователей в классе {class_name}.",
+                self.main_menu_keyboard()
+            )
+
     def run(self):
-        logger.info("Бот запущен с новыми функциями!")
+        logger.info("Бот запущен со всеми функциями!")
         
         try:
             delete_url = f"{BASE_URL}/deleteWebhook"
