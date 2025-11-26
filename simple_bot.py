@@ -949,7 +949,7 @@ class SimpleSchoolBot:
                 [{"text": "👥 Список пользователей", "callback_data": "admin_users"}],
                 [{"text": "❌ Удалить пользователя", "callback_data": "admin_delete_user"}],
                 [{"text": "📝 Редактировать расписание", "callback_data": "admin_edit_schedule"}],
-                [{"text": "🏫 Управление классов", "callback_data": "admin_manage_classes"}],
+                [{"text": "🏫 Управление классами", "callback_data": "admin_manage_classes"}],
                 [{"text": "🕧 Управление звонками", "callback_data": "admin_bells"}],
                 [{"text": "📤 Загрузить Excel", "callback_data": "admin_upload_excel"}],
                 [{"text": "📊 Статистика", "callback_data": "admin_stats"}],
