@@ -5,13 +5,17 @@ import time
 import re
 import os
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from collections import defaultdict
 import io
 import psycopg2
 from urllib.parse import urlparse
 import sys
+import json
+import pytz
+from threading import Thread
+import schedule
 
 try:
     from dotenv import load_dotenv
@@ -25,6 +29,8 @@ if not BOT_TOKEN:
     exit(1)
 
 ADMINS = [admin.strip() for admin in os.environ.get('ADMINS', 'r1kuza,nadya_yakovleva01,Priikalist').split(',') if admin.strip()]
+WEATHER_API_KEY = os.environ.get('WEATHER_API_KEY')
+SAMARA_TIMEZONE = pytz.timezone('Europe/Samara')
 
 MAX_MESSAGE_LENGTH = 4000
 MAX_USERS_PER_CLASS = 30
@@ -48,7 +54,6 @@ class DatabaseManager:
         database_url = os.environ.get('DATABASE_URL')
         
         if database_url:
-            # PostgreSQL в Railway
             try:
                 url = urlparse(database_url)
                 self.conn = psycopg2.connect(
@@ -65,7 +70,6 @@ class DatabaseManager:
                 logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
                 self.fallback_to_sqlite()
         else:
-            # SQLite для локальной разработки
             self.fallback_to_sqlite()
     
     def fallback_to_sqlite(self):
@@ -80,7 +84,6 @@ class DatabaseManager:
     
     def execute(self, query, params=None):
         if self.db_type == 'postgresql':
-            # Заменяем ? на %s для PostgreSQL
             query = query.replace('?', '%s')
         
         cursor = self.conn.cursor()
@@ -107,6 +110,170 @@ class DatabaseManager:
     def close(self):
         if self.conn:
             self.conn.close()
+
+    def create_tables(self):
+        try:
+            # Существующие таблицы
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    full_name TEXT NOT NULL,
+                    class TEXT NOT NULL,
+                    role TEXT DEFAULT 'user',
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS schedule (
+                    id SERIAL PRIMARY KEY,
+                    class TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    lesson_number INTEGER,
+                    subject TEXT,
+                    teacher TEXT,
+                    room TEXT,
+                    UNIQUE(class, day, lesson_number)
+                )
+            """)
+            
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS bell_schedule (
+                    lesson_number INTEGER PRIMARY KEY,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL
+                )
+            """)
+            
+            # НОВЫЕ ТАБЛИЦЫ
+            # Настройки уведомлений
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS notification_settings (
+                    user_id BIGINT PRIMARY KEY,
+                    smart_notifications BOOLEAN DEFAULT FALSE,
+                    weather_notifications BOOLEAN DEFAULT FALSE,
+                    news_notifications BOOLEAN DEFAULT TRUE,
+                    achievement_notifications BOOLEAN DEFAULT TRUE,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            """)
+            
+            # Система ролей
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS user_roles (
+                    user_id BIGINT PRIMARY KEY,
+                    role_type TEXT NOT NULL CHECK(role_type IN ('guest', 'student', 'teacher')),
+                    additional_info TEXT,
+                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            """)
+            
+            # Школьные новости
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS school_news (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    target_audience TEXT DEFAULT 'all',
+                    publish_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    is_published BOOLEAN DEFAULT TRUE
+                )
+            """)
+            
+            # Система достижений
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS achievements (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    icon TEXT NOT NULL,
+                    condition_type TEXT NOT NULL,
+                    condition_value INTEGER
+                )
+            """)
+            
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS user_achievements (
+                    user_id BIGINT,
+                    achievement_id INTEGER,
+                    achieved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, achievement_id),
+                    FOREIGN KEY (user_id) REFERENCES users(user_id),
+                    FOREIGN KEY (achievement_id) REFERENCES achievements(id)
+                )
+            """)
+            
+            # Статистика посещений
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS user_activity (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    details TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            """)
+            
+            # Электронный дневник
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS student_grades (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    subject TEXT NOT NULL,
+                    grade INTEGER NOT NULL,
+                    grade_type TEXT NOT NULL,
+                    lesson_date DATE NOT NULL,
+                    teacher_comment TEXT,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            """)
+            
+            # Добавляем начальные данные для звонков
+            result = self.fetchone("SELECT COUNT(*) FROM bell_schedule")
+            if result and result[0] == 0:
+                bell_schedule = [
+                    (1, '8:00', '8:40'),
+                    (2, '8:50', '9:30'),
+                    (3, '9:40', '10:20'),
+                    (4, '10:30', '11:10'),
+                    (5, '11:25', '12:05'),
+                    (6, '12:10', '12:50'),
+                    (7, '13:00', '13:40')
+                ]
+                for bell in bell_schedule:
+                    self.execute(
+                        "INSERT INTO bell_schedule (lesson_number, start_time, end_time) VALUES (?, ?, ?) ON CONFLICT (lesson_number) DO NOTHING",
+                        bell
+                    )
+                logger.info("✅ Начальные данные для звонков созданы")
+            
+            # Добавляем стандартные достижения
+            self._create_default_achievements()
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания таблиц: {e}")
+            raise
+
+    def _create_default_achievements(self):
+        """Создаем стандартные достижения"""
+        default_achievements = [
+            ("🎓 Первые шаги", "Зарегистрировался в системе", "🎓", "registration", 1),
+            ("📚 Любознательный", "Посмотрел расписание 10 раз", "📚", "schedule_views", 10),
+            ("⭐ Активный ученик", "Использовал бота 50 раз", "⭐", "total_actions", 50),
+            ("🏆 Отличник", "Получил 5 хороших оценок", "🏆", "good_grades", 5),
+            ("📰 Информированный", "Прочитал все новости", "📰", "news_read", 10),
+            ("🌦️ Метеоролог", "Включил уведомления о погоде", "🌦️", "weather_enabled", 1)
+        ]
+        
+        for name, description, icon, condition_type, condition_value in default_achievements:
+            self.execute(
+                "INSERT INTO achievements (name, description, icon, condition_type, condition_value) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                (name, description, icon, condition_type, condition_value)
+            )
 
 class RateLimiter:
     def __init__(self, max_requests=MAX_REQUESTS_PER_MINUTE, window=60):
@@ -135,78 +302,321 @@ class SimpleSchoolBot:
         self.rate_limiter = RateLimiter()
         self.db = DatabaseManager()
         self.init_db()
+        self.setup_scheduler()
     
     def init_db(self):
         self.create_tables()
     
     def create_tables(self):
+        self.db.create_tables()
+    
+    def setup_scheduler(self):
+        """Настраиваем планировщик для уведомлений"""
+        def run_scheduler():
+            while True:
+                schedule.run_pending()
+                time.sleep(60)
+        
+        schedule.every().day.at("07:00").do(self.send_weather_notifications)
+        schedule.every().day.at("12:00").do(self.send_weather_notifications)
+        
+        scheduler_thread = Thread(target=run_scheduler, daemon=True)
+        scheduler_thread.start()
+    
+    # НОВЫЕ ФУНКЦИИ - УМНЫЕ УВЕДОМЛЕНИЯ
+    def get_notification_settings(self, user_id):
+        result = self.db.fetchone(
+            "SELECT smart_notifications, weather_notifications, news_notifications, achievement_notifications FROM notification_settings WHERE user_id = ?",
+            (user_id,)
+        )
+        if result:
+            return {
+                'smart_notifications': result[0],
+                'weather_notifications': result[1],
+                'news_notifications': result[2],
+                'achievement_notifications': result[3]
+            }
+        else:
+            self.db.execute(
+                "INSERT INTO notification_settings (user_id) VALUES (?)",
+                (user_id,)
+            )
+            return {
+                'smart_notifications': False,
+                'weather_notifications': False,
+                'news_notifications': True,
+                'achievement_notifications': True
+            }
+    
+    def update_notification_settings(self, user_id, settings):
+        self.db.execute(
+            """INSERT INTO notification_settings 
+            (user_id, smart_notifications, weather_notifications, news_notifications, achievement_notifications) 
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (user_id) DO UPDATE SET
+            smart_notifications = EXCLUDED.smart_notifications,
+            weather_notifications = EXCLUDED.weather_notifications,
+            news_notifications = EXCLUDED.news_notifications,
+            achievement_notifications = EXCLUDED.achievement_notifications""",
+            (user_id, settings.get('smart_notifications', False), settings.get('weather_notifications', False),
+             settings.get('news_notifications', True), settings.get('achievement_notifications', True))
+        )
+    
+    # НОВЫЕ ФУНКЦИИ - РЕГИСТРАЦИЯ ПО РОЛЯМ
+    def register_user_with_role(self, user_id, full_name, class_name, role_type, additional_info=None):
+        if not self.create_user(user_id, full_name, class_name):
+            return False
+        
+        self.db.execute(
+            "INSERT INTO user_roles (user_id, role_type, additional_info) VALUES (?, ?, ?)",
+            (user_id, role_type, additional_info)
+        )
+        
+        self.log_user_activity(user_id, "registration", f"Role: {role_type}")
+        self.check_achievements(user_id, "registration")
+        return True
+    
+    def get_user_role(self, user_id):
+        result = self.db.fetchone(
+            "SELECT role_type, additional_info FROM user_roles WHERE user_id = ?",
+            (user_id,)
+        )
+        return result if result else ('guest', None)
+    
+    # НОВЫЕ ФУНКЦИИ - ШКОЛЬНЫЕ НОВОСТИ
+    def add_news(self, title, content, author, target_audience="all"):
+        self.db.execute(
+            "INSERT INTO school_news (title, content, author, target_audience) VALUES (?, ?, ?, ?)",
+            (title, content, author, target_audience)
+        )
+        self.notify_about_news(title, content)
+        return True
+    
+    def get_news(self, limit=10, for_class=None):
+        if for_class:
+            return self.db.fetchall(
+                """SELECT title, content, author, publish_date 
+                FROM school_news 
+                WHERE (target_audience = ? OR target_audience = 'all') AND is_published = TRUE
+                ORDER BY publish_date DESC LIMIT ?""",
+                (for_class, limit)
+            )
+        else:
+            return self.db.fetchall(
+                """SELECT title, content, author, publish_date 
+                FROM school_news 
+                WHERE is_published = TRUE
+                ORDER BY publish_date DESC LIMIT ?""",
+                (limit,)
+            )
+    
+    def notify_about_news(self, title, content):
+        users = self.db.fetchall(
+            "SELECT user_id FROM notification_settings WHERE news_notifications = TRUE"
+        )
+        for user in users:
+            message = f"📰 <b>Новая школьная новость</b>\n\n<b>{self.safe_message(title)}</b>\n\n{self.safe_message(content)}"
+            self.send_message(user[0], message)
+    
+    # НОВЫЕ ФУНКЦИИ - СИСТЕМА ДОСТИЖЕНИЙ
+    def check_achievements(self, user_id, action_type, value=1):
+        achievements = self.db.fetchall(
+            "SELECT id, name, description, icon, condition_type, condition_value FROM achievements WHERE condition_type = ?",
+            (action_type,)
+        )
+        
+        for achievement in achievements:
+            achievement_id, name, description, icon, condition_type, condition_value = achievement
+            
+            user_progress = self.get_user_achievement_progress(user_id, condition_type)
+            if user_progress >= condition_value:
+                self.grant_achievement(user_id, achievement_id, name, description, icon)
+    
+    def get_user_achievement_progress(self, user_id, condition_type):
+        if condition_type == "registration":
+            return 1
+        elif condition_type == "schedule_views":
+            result = self.db.fetchone(
+                "SELECT COUNT(*) FROM user_activity WHERE user_id = ? AND action_type = 'schedule_view'",
+                (user_id,)
+            )
+            return result[0] if result else 0
+        elif condition_type == "total_actions":
+            result = self.db.fetchone(
+                "SELECT COUNT(*) FROM user_activity WHERE user_id = ?",
+                (user_id,)
+            )
+            return result[0] if result else 0
+        elif condition_type == "good_grades":
+            result = self.db.fetchone(
+                "SELECT COUNT(*) FROM student_grades WHERE user_id = ? AND grade >= 4",
+                (user_id,)
+            )
+            return result[0] if result else 0
+        elif condition_type == "news_read":
+            result = self.db.fetchone(
+                "SELECT COUNT(*) FROM user_activity WHERE user_id = ? AND action_type = 'news_read'",
+                (user_id,)
+            )
+            return result[0] if result else 0
+        elif condition_type == "weather_enabled":
+            settings = self.get_notification_settings(user_id)
+            return 1 if settings.get('weather_notifications') else 0
+        
+        return 0
+    
+    def grant_achievement(self, user_id, achievement_id, name, description, icon):
+        existing = self.db.fetchone(
+            "SELECT 1 FROM user_achievements WHERE user_id = ? AND achievement_id = ?",
+            (user_id, achievement_id)
+        )
+        if existing:
+            return
+        
+        self.db.execute(
+            "INSERT INTO user_achievements (user_id, achievement_id) VALUES (?, ?)",
+            (user_id, achievement_id)
+        )
+        
+        settings = self.get_notification_settings(user_id)
+        if settings.get('achievement_notifications'):
+            message = f"{icon} <b>Новое достижение!</b>\n\n<b>{name}</b>\n{description}"
+            self.send_message(user_id, message)
+    
+    def get_user_achievements(self, user_id):
+        return self.db.fetchall("""
+            SELECT a.name, a.description, a.icon, ua.achieved_at 
+            FROM user_achievements ua 
+            JOIN achievements a ON ua.achievement_id = a.id 
+            WHERE ua.user_id = ? 
+            ORDER BY ua.achieved_at DESC
+        """, (user_id,))
+    
+    # НОВЫЕ ФУНКЦИИ - ПОГОДА
+    def get_weather(self):
+        if not WEATHER_API_KEY:
+            return "🌤️ Погода в Самаре: сервис погоды не настроен"
+        
         try:
-            # Создаем таблицу пользователей
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    full_name TEXT NOT NULL,
-                    class TEXT NOT NULL,
-                    role TEXT DEFAULT 'user',
-                    registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            url = f"http://api.weatherapi.com/v1/current.json?key={WEATHER_API_KEY}&q=Samara&lang=ru"
+            response = requests.get(url, timeout=10)
+            data = response.json()
             
-            # Создаем таблицу расписания
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS schedule (
-                    id SERIAL PRIMARY KEY,
-                    class TEXT NOT NULL,
-                    day TEXT NOT NULL,
-                    lesson_number INTEGER,
-                    subject TEXT,
-                    teacher TEXT,
-                    room TEXT,
-                    UNIQUE(class, day, lesson_number)
-                )
-            """)
+            current = data['current']
+            temp = current['temp_c']
+            condition = current['condition']['text']
+            humidity = current['humidity']
+            wind = current['wind_kph']
             
-            # Создаем таблицу звонков
-            self.db.execute("""
-                CREATE TABLE IF NOT EXISTS bell_schedule (
-                    lesson_number INTEGER PRIMARY KEY,
-                    start_time TEXT NOT NULL,
-                    end_time TEXT NOT NULL
-                )
-            """)
-            
-            # Добавляем начальные данные для звонков, если таблица пустая
-            result = self.db.fetchone("SELECT COUNT(*) FROM bell_schedule")
-            if result and result[0] == 0:
-                bell_schedule = [
-                    (1, '8:00', '8:40'),
-                    (2, '8:50', '9:30'),
-                    (3, '9:40', '10:20'),
-                    (4, '10:30', '11:10'),
-                    (5, '11:25', '12:05'),
-                    (6, '12:10', '12:50'),
-                    (7, '13:00', '13:40')
-                ]
-                for bell in bell_schedule:
-                    self.db.execute(
-                        "INSERT INTO bell_schedule (lesson_number, start_time, end_time) VALUES (?, ?, ?) ON CONFLICT (lesson_number) DO NOTHING",
-                        bell
-                    )
-                logger.info("✅ Начальные данные для звонков созданы")
-            
+            return (f"🌤️ <b>Погода в Самаре</b>\n\n"
+                   f"🌡️ Температура: {temp}°C\n"
+                   f"☁️ Состояние: {condition}\n"
+                   f"💧 Влажность: {humidity}%\n"
+                   f"💨 Ветер: {wind} км/ч")
+        
         except Exception as e:
-            logger.error(f"Ошибка создания таблиц: {e}")
-            raise
+            logger.error(f"Ошибка получения погоды: {e}")
+            return "🌤️ Погода в Самаре: временно недоступна"
+    
+    def send_weather_notifications(self):
+        users = self.db.fetchall(
+            "SELECT user_id FROM notification_settings WHERE weather_notifications = TRUE"
+        )
+        weather_message = self.get_weather()
+        
+        for user in users:
+            self.send_message(user[0], weather_message)
+    
+    # НОВЫЕ ФУНКЦИИ - СТАТИСТИКА ПОСЕЩЕНИЙ
+    def log_user_activity(self, user_id, action_type, details=None):
+        self.db.execute(
+            "INSERT INTO user_activity (user_id, action_type, details) VALUES (?, ?, ?)",
+            (user_id, action_type, details)
+        )
+    
+    def get_user_statistics(self, user_id):
+        total_actions = self.db.fetchone(
+            "SELECT COUNT(*) FROM user_activity WHERE user_id = ?",
+            (user_id,)
+        )
+        total_actions = total_actions[0] if total_actions else 0
+        
+        schedule_views = self.db.fetchone(
+            "SELECT COUNT(*) FROM user_activity WHERE user_id = ? AND action_type = 'schedule_view'",
+            (user_id,)
+        )
+        schedule_views = schedule_views[0] if schedule_views else 0
+        
+        news_read = self.db.fetchone(
+            "SELECT COUNT(*) FROM user_activity WHERE user_id = ? AND action_type = 'news_read'",
+            (user_id,)
+        )
+        news_read = news_read[0] if news_read else 0
+        
+        last_active = self.db.fetchone(
+            "SELECT timestamp FROM user_activity WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1",
+            (user_id,)
+        )
+        
+        return {
+            'total_actions': total_actions,
+            'schedule_views': schedule_views,
+            'news_read': news_read,
+            'last_active': last_active[0] if last_active else None
+        }
+    
+    # НОВЫЕ ФУНКЦИИ - ЭЛЕКТРОННЫЙ ДНЕВНИК
+    def add_grade(self, user_id, subject, grade, grade_type, lesson_date, teacher_comment=None):
+        self.db.execute(
+            """INSERT INTO student_grades (user_id, subject, grade, grade_type, lesson_date, teacher_comment) 
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, subject, grade, grade_type, lesson_date, teacher_comment)
+        )
+        
+        if grade >= 4:
+            self.check_achievements(user_id, "good_grades")
+    
+    def get_student_grades(self, user_id, subject=None, limit=20):
+        if subject:
+            return self.db.fetchall(
+                """SELECT subject, grade, grade_type, lesson_date, teacher_comment 
+                FROM student_grades 
+                WHERE user_id = ? AND subject = ? 
+                ORDER BY lesson_date DESC LIMIT ?""",
+                (user_id, subject, limit)
+            )
+        else:
+            return self.db.fetchall(
+                """SELECT subject, grade, grade_type, lesson_date, teacher_comment 
+                FROM student_grades 
+                WHERE user_id = ? 
+                ORDER BY lesson_date DESC LIMIT ?""",
+                (user_id, limit)
+            )
+    
+    def get_student_average_grade(self, user_id, subject=None):
+        if subject:
+            result = self.db.fetchone(
+                "SELECT AVG(grade) FROM student_grades WHERE user_id = ? AND subject = ?",
+                (user_id, subject)
+            )
+        else:
+            result = self.db.fetchone(
+                "SELECT AVG(grade) FROM student_grades WHERE user_id = ?",
+                (user_id,)
+            )
+        
+        return round(result[0], 2) if result and result[0] else 0.0
 
+    # СУЩЕСТВУЮЩИЕ МЕТОДЫ (оригинальные 800+ строк)
     def format_date(self, date_obj):
-        """Форматирует дату из базы данных в строку"""
         if not date_obj:
             return "неизвестно"
         
-        if hasattr(date_obj, 'strftime'):  # Это объект datetime
+        if hasattr(date_obj, 'strftime'):
             return date_obj.strftime("%Y-%m-%d")
-        elif isinstance(date_obj, str):  # Это строка
-            return date_obj.split()[0]  # Берем только дату без времени
+        elif isinstance(date_obj, str):
+            return date_obj.split()[0]
         else:
             return str(date_obj)
     
@@ -325,7 +735,6 @@ class SimpleSchoolBot:
             return False
             
         try:
-            # Проверяем количество пользователей в классе
             result = self.db.fetchone("SELECT COUNT(*) FROM users WHERE class = ?", (class_name,))
             count = result[0] if result else 0
             
@@ -399,15 +808,78 @@ class SimpleSchoolBot:
     def is_admin(self, username):
         return username and username.lower() in [admin.lower() for admin in ADMINS]
     
+    # ОБНОВЛЕННОЕ ГЛАВНОЕ МЕНЮ
     def main_menu_keyboard(self):
         return {
             "keyboard": [
                 [{"text": "📚 Моё расписание"}, {"text": "🏫 Общее расписание"}],
-                [{"text": "🔔 Звонки"}, {"text": "ℹ️ Помощь"}]
+                [{"text": "🔔 Звонки"}, {"text": "📰 Новости"}],
+                [{"text": "⚙️ Настройки"}, {"text": "🏆 Достижения"}],
+                [{"text": "📊 Дневник"}, {"text": "📈 Статистика"}],
+                [{"text": "ℹ️ Помощь"}]
             ],
             "resize_keyboard": True
         }
     
+    # НОВЫЕ КЛАВИАТУРЫ
+    def notifications_settings_keyboard(self):
+        return {
+            "inline_keyboard": [
+                [{"text": "🔔 Умные уведомления", "callback_data": "toggle_smart"}],
+                [{"text": "🌤️ Уведомления о погоде", "callback_data": "toggle_weather"}],
+                [{"text": "📰 Новости школы", "callback_data": "toggle_news"}],
+                [{"text": "🏆 Достижения", "callback_data": "toggle_achievements"}],
+                [{"text": "⬅️ Назад", "callback_data": "settings_back"}]
+            ]
+        }
+    
+    def role_selection_keyboard(self):
+        return {
+            "keyboard": [
+                [{"text": "👨‍🎓 Ученик"}, {"text": "👨‍🏫 Учитель"}],
+                [{"text": "👤 Гость"}, {"text": "⬅️ Назад"}]
+            ],
+            "resize_keyboard": True
+        }
+    
+    def achievements_keyboard(self):
+        return {
+            "inline_keyboard": [
+                [{"text": "🏆 Мои достижения", "callback_data": "my_achievements"}],
+                [{"text": "📊 Прогресс", "callback_data": "achievement_progress"}],
+                [{"text": "⬅️ Назад", "callback_data": "achievements_back"}]
+            ]
+        }
+    
+    def news_keyboard(self):
+        return {
+            "inline_keyboard": [
+                [{"text": "📰 Последние новости", "callback_data": "recent_news"}],
+                [{"text": "📊 Статистика новостей", "callback_data": "news_stats"}],
+                [{"text": "⬅️ Назад", "callback_data": "news_back"}]
+            ]
+        }
+    
+    def diary_keyboard(self):
+        return {
+            "inline_keyboard": [
+                [{"text": "📊 Мои оценки", "callback_data": "my_grades"}],
+                [{"text": "📈 Средний балл", "callback_data": "average_grade"}],
+                [{"text": "📚 По предметам", "callback_data": "grades_by_subject"}],
+                [{"text": "⬅️ Назад", "callback_data": "diary_back"}]
+            ]
+        }
+    
+    def statistics_keyboard(self):
+        return {
+            "inline_keyboard": [
+                [{"text": "📈 Моя статистика", "callback_data": "my_statistics"}],
+                [{"text": "🏆 Достижения", "callback_data": "my_achievements"}],
+                [{"text": "⬅️ Назад", "callback_data": "stats_back"}]
+            ]
+        }
+
+    # СУЩЕСТВУЮЩИЕ КЛАВИАТУРЫ
     def admin_menu_inline_keyboard(self):
         return {
             "inline_keyboard": [
@@ -549,7 +1021,7 @@ class SimpleSchoolBot:
             logger.error(f"Ошибка обновления расписания звонков: {e}")
             return False
 
-    # ОРИГИНАЛЬНЫЙ ПАРСЕР EXCEL
+    # ОРИГИНАЛЬНЫЙ ПАРСЕР EXCEL (полностью сохранен)
     def parse_excel_schedule(self, file_content, shift):
         try:
             import pandas as pd
@@ -711,15 +1183,12 @@ class SimpleSchoolBot:
     def _parse_day_schedule(self, df, start_row, end_row, class_columns, shift, day_name):
         lessons = []
         
-        # Собираем все номера уроков из колонки с номерами (индекс 1)
         lesson_numbers = {}
         for row_idx in range(start_row, min(end_row, len(df))):
             row = df.iloc[row_idx]
             
-            # Ищем номер урока во второй колонке (индекс 1)
             if len(row) > 1 and pd.notna(row[1]):
                 lesson_str = str(row[1]).strip()
-                # Извлекаем число из ячейки
                 numbers = re.findall(r'\d+', lesson_str)
                 if numbers:
                     lesson_num = int(numbers[0])
@@ -727,7 +1196,6 @@ class SimpleSchoolBot:
                         lesson_numbers[row_idx] = lesson_num
                         logger.debug(f"Найден номер урока {lesson_num} в строке {row_idx}")
         
-        # Обрабатываем строки с уроками
         current_lesson_num = 1
         
         for row_idx in range(start_row, min(end_row, len(df))):
@@ -736,27 +1204,22 @@ class SimpleSchoolBot:
             if all(pd.isna(cell) for cell in row):
                 continue
             
-            # Определяем номер урока
             lesson_num = lesson_numbers.get(row_idx)
             if lesson_num is not None:
                 current_lesson_num = lesson_num
             else:
-                # Если номер не найден, используем текущий
                 lesson_num = current_lesson_num
             
             lesson_found_in_row = False
             
             for class_name, col_idx in class_columns.items():
-                # Проверяем колонку с предметом
                 subject_col = col_idx
                 if subject_col < len(row) and pd.notna(row[subject_col]):
                     subject = str(row[subject_col]).strip()
                     
-                    # Пропускаем пустые значения и названия дней
                     if not subject or subject in ['-', '—', ''] or self._is_day_of_week(subject):
                         continue
                     
-                    # Получаем кабинет из следующей колонки
                     room = ""
                     room_col = col_idx + 1
                     if room_col < len(row) and pd.notna(row[room_col]):
@@ -764,7 +1227,6 @@ class SimpleSchoolBot:
                         if room_cell and not self._is_day_of_week(room_cell):
                             room = room_cell
                     
-                    # Извлекаем учителя из скобок в названии предмета
                     teacher = ""
                     if '(' in subject and ')' in subject:
                         teacher_match = re.search(r'\((.*?)\)', subject)
@@ -785,8 +1247,6 @@ class SimpleSchoolBot:
                     lesson_found_in_row = True
                     logger.debug(f"Добавлен урок: {class_name}, {day_name}, {lesson_num}, {subject}, {teacher}, {room}")
         
-            # Увеличиваем номер урока только если в строке был найден хотя бы один урок
-            # и если мы не используем явный номер из ячейки
             if lesson_found_in_row and row_idx not in lesson_numbers:
                 current_lesson_num += 1
         
@@ -883,14 +1343,12 @@ class SimpleSchoolBot:
             imported_count = 0
             error_count = 0
             
-            # Удаляем старое расписание для классов из файла
             imported_classes = set(lesson['class'] for lesson in lessons_data)
             
             for class_name in imported_classes:
                 self.db.execute("DELETE FROM schedule WHERE class = ?", (class_name,))
                 logger.info(f"Удалены старые уроки для класса {class_name}")
             
-            # Импортируем новые данные
             for lesson in lessons_data:
                 try:
                     lesson_number = int(lesson['lesson_number'])
@@ -915,6 +1373,7 @@ class SimpleSchoolBot:
             logger.error(f"Ошибка импорта из Excel для смены {shift}: {e}")
             return False, f"Ошибка импорта для {shift} смены: {str(e)}"
 
+    # ОБНОВЛЕННЫЕ ОБРАБОТЧИКИ С НОВЫМИ ФУНКЦИЯМИ
     def handle_start(self, chat_id, user):
         user_data = self.get_user(user["id"])
         
@@ -943,11 +1402,17 @@ class SimpleSchoolBot:
     def handle_help(self, chat_id, username):
         text = (
             "📚 <b>Школьный бот - помощь</b>\n\n"
-            "Я помогу тебе узнать расписание уроков.\n\n"
+            "Я помогу тебе узнать расписание уроков и многое другое.\n\n"
             "<b>Основные команды:</b>\n"
             "• /start - начать работу\n"
             "• /help - показать эту справку\n\n"
-            "<b>Возможности:</b>\n"
+            "<b>Новые возможности:</b>\n"
+            "• <b>📰 Новости</b> - школьные новости и объявления\n"
+            "• <b>⚙️ Настройки</b> - умные уведомления и предпочтения\n"
+            "• <b>🏆 Достижения</b> - система наград за активность\n"
+            "• <b>📊 Дневник</b> - электронный дневник с оценками\n"
+            "• <b>📈 Статистика</b> - ваша активность и прогресс\n\n"
+            "<b>Классические функции:</b>\n"
             "• <b>Моё расписание</b> - расписание для твоего класса\n"
             "• <b>Общее расписание</b> - расписание для любого класса\n"
             "• <b>Звонки</b> - расписание звонков\n\n"
@@ -1091,6 +1556,7 @@ class SimpleSchoolBot:
                 self.send_message(chat_id, "❌ Неверный формат времени. Используйте ЧЧ:ММ", self.bells_management_inline_keyboard())
                 del self.admin_states[username]
     
+    # ОБНОВЛЕННЫЙ ГЛАВНЫЙ ОБРАБОТЧИК МЕНЮ
     def handle_main_menu(self, chat_id, user_id, text, username):
         user_data = self.get_user(user_id)
         
@@ -1109,6 +1575,7 @@ class SimpleSchoolBot:
                 f"Выберите день недели для расписания {self.safe_message(class_name)} класса:",
                 self.day_selection_inline_keyboard()
             )
+            self.log_user_activity(user_id, "schedule_view", f"Class: {class_name}")
         
         elif text == "🏫 Общее расписание":
             self.user_states[user_id] = {"action": "general_schedule"}
@@ -1133,8 +1600,26 @@ class SimpleSchoolBot:
             bells_text += "\n📝 Уроки по 40 минут"
             self.send_message(chat_id, bells_text)
         
+        elif text == "📰 Новости":
+            self.handle_news_menu(chat_id, user_id)
+        
+        elif text == "⚙️ Настройки":
+            self.handle_notifications_settings(chat_id, user_id)
+        
+        elif text == "🏆 Достижения":
+            self.handle_achievements_menu(chat_id, user_id)
+        
+        elif text == "📊 Дневник":
+            self.handle_diary_menu(chat_id, user_id)
+        
+        elif text == "📈 Статистика":
+            self.handle_statistics_menu(chat_id, user_id)
+        
         elif text == "ℹ️ Помощь":
             self.handle_help(chat_id, username)
+        
+        elif text in ["👨‍🎓 Ученик", "👨‍🏫 Учитель", "👤 Гость"]:
+            self.handle_role_registration(chat_id, user_id, text)
         
         elif text == "⬅️ Назад":
             if user_id in self.user_states:
@@ -1144,6 +1629,95 @@ class SimpleSchoolBot:
         elif self.is_valid_class(text):
             self.handle_class_selection(chat_id, user_id, text)
     
+    # НОВЫЕ ОБРАБОТЧИКИ МЕНЮ
+    def handle_notifications_settings(self, chat_id, user_id):
+        settings = self.get_notification_settings(user_id)
+        
+        smart_status = "✅ ВКЛ" if settings['smart_notifications'] else "❌ ВЫКЛ"
+        weather_status = "✅ ВКЛ" if settings['weather_notifications'] else "❌ ВЫКЛ"
+        news_status = "✅ ВКЛ" if settings['news_notifications'] else "❌ ВЫКЛ"
+        achievements_status = "✅ ВКЛ" if settings['achievement_notifications'] else "❌ ВЫКЛ"
+        
+        text = (f"⚙️ <b>Настройки уведомлений</b>\n\n"
+               f"🔔 Умные уведомления: {smart_status}\n"
+               f"🌤️ Погода: {weather_status}\n"
+               f"📰 Новости: {news_status}\n"
+               f"🏆 Достижения: {achievements_status}\n\n"
+               f"Нажмите на кнопку для переключения:")
+        
+        self.send_message(chat_id, text, self.notifications_settings_keyboard())
+    
+    def handle_achievements_menu(self, chat_id, user_id):
+        achievements = self.get_user_achievements(user_id)
+        text = "🏆 <b>Система достижений</b>\n\n"
+        
+        if achievements:
+            text += f"🎯 Получено достижений: {len(achievements)}\n\n"
+            for i, (name, desc, icon, date) in enumerate(achievements[:3], 1):
+                text += f"{icon} <b>{name}</b>\n{desc}\n\n"
+        else:
+            text += "У вас пока нет достижений. Продолжайте использовать бота для их получения!"
+        
+        self.send_message(chat_id, text, self.achievements_keyboard())
+    
+    def handle_news_menu(self, chat_id, user_id):
+        news_count = self.db.fetchone("SELECT COUNT(*) FROM school_news WHERE is_published = TRUE")
+        news_count = news_count[0] if news_count else 0
+        user_news_read = self.get_user_statistics(user_id)['news_read']
+        
+        text = (f"📰 <b>Школьные новости</b>\n\n"
+               f"📊 Всего новостей: {news_count}\n"
+               f"📖 Прочитано вами: {user_news_read}\n\n"
+               f"Будьте в курсе всех школьных событий!")
+        
+        self.send_message(chat_id, text, self.news_keyboard())
+    
+    def handle_diary_menu(self, chat_id, user_id):
+        avg_grade = self.get_student_average_grade(user_id)
+        total_grades = self.db.fetchone(
+            "SELECT COUNT(*) FROM student_grades WHERE user_id = ?",
+            (user_id,)
+        )
+        total_grades = total_grades[0] if total_grades else 0
+        
+        text = (f"📊 <b>Электронный дневник</b>\n\n"
+               f"📈 Средний балл: {avg_grade}\n"
+               f"📚 Всего оценок: {total_grades}\n\n"
+               f"Здесь вы можете посмотреть свои оценки и успеваемость.")
+        
+        self.send_message(chat_id, text, self.diary_keyboard())
+    
+    def handle_statistics_menu(self, chat_id, user_id):
+        stats = self.get_user_statistics(user_id)
+        achievements = len(self.get_user_achievements(user_id))
+        
+        last_active = self.format_date(stats['last_active']) if stats['last_active'] else "неизвестно"
+        
+        text = (f"📈 <b>Ваша статистика</b>\n\n"
+               f"📊 Всего действий: {stats['total_actions']}\n"
+               f"📚 Просмотров расписания: {stats['schedule_views']}\n"
+               f"📰 Прочитано новостей: {stats['news_read']}\n"
+               f"🏆 Получено достижений: {achievements}\n"
+               f"🕐 Последняя активность: {last_active}")
+        
+        self.send_message(chat_id, text, self.statistics_keyboard())
+    
+    def handle_role_registration(self, chat_id, user_id, role_text):
+        role_map = {
+            "👨‍🎓 Ученик": "student",
+            "👨‍🏫 Учитель": "teacher", 
+            "👤 Гость": "guest"
+        }
+        
+        role_type = role_map[role_text]
+        self.user_states[user_id] = {"action": "role_registration", "role": role_type}
+        
+        if role_type == "guest":
+            self.send_message(chat_id, "Введите ваше ФИО:", self.cancel_keyboard())
+        else:
+            self.send_message(chat_id, "Введите ваше ФИО и класс в формате: Фамилия Имя Отчество, Класс", self.cancel_keyboard())
+    
+    # ОБНОВЛЕННЫЙ ОБРАБОТЧИК CALLBACK
     def handle_callback_query(self, update):
         callback_query = update.get("callback_query")
         if not callback_query:
@@ -1157,7 +1731,30 @@ class SimpleSchoolBot:
         
         logger.info(f"Callback received: {data} from user {username}")
         
-        if data.startswith("day_"):
+        # Обработка новых callback
+        if data.startswith("toggle_"):
+            self.handle_toggle_setting(chat_id, user_id, data)
+        elif data == "my_achievements":
+            self.show_user_achievements(chat_id, user_id)
+        elif data == "achievement_progress":
+            self.show_achievement_progress(chat_id, user_id)
+        elif data == "recent_news":
+            self.show_recent_news(chat_id, user_id)
+        elif data == "news_stats":
+            self.show_news_statistics(chat_id, user_id)
+        elif data == "my_grades":
+            self.show_user_grades(chat_id, user_id)
+        elif data == "average_grade":
+            self.show_average_grades(chat_id, user_id)
+        elif data == "grades_by_subject":
+            self.show_grades_by_subject(chat_id, user_id)
+        elif data == "my_statistics":
+            self.show_detailed_statistics(chat_id, user_id)
+        elif data in ["settings_back", "achievements_back", "news_back", "diary_back", "stats_back"]:
+            self.send_message(chat_id, "Главное меню", self.main_menu_keyboard())
+        
+        # Существующие обработчики
+        elif data.startswith("day_"):
             day_code = data[4:]
             day_map = {
                 'monday': 'понедельник',
@@ -1169,16 +1766,12 @@ class SimpleSchoolBot:
             }
             day_text = day_map.get(day_code, day_code)
             
-            # Проверяем, является ли это действием администратора по редактированию расписания
             if username in self.admin_states and self.admin_states[username].get("action") == "edit_schedule_day":
-                logger.info(f"Admin schedule day selection: {day_text}")
                 self.handle_schedule_day_selection(chat_id, username, day_text)
             else:
-                logger.info(f"User day selection: {day_text}")
                 self.handle_day_selection(chat_id, user_id, day_text)
             
         elif data.startswith("admin_"):
-            logger.info(f"Admin callback: {data}")
             self.handle_admin_callback(chat_id, username, data)
             
         self.answer_callback_query(callback_query["id"])
@@ -1222,6 +1815,194 @@ class SimpleSchoolBot:
         elif data == "admin_view_bells":
             self.show_all_bells(chat_id)
     
+    # НОВЫЕ МЕТОДЫ ДЛЯ ОБРАБОТКИ CALLBACK
+    def handle_toggle_setting(self, chat_id, user_id, data):
+        settings = self.get_notification_settings(user_id)
+        setting_map = {
+            "toggle_smart": "smart_notifications",
+            "toggle_weather": "weather_notifications", 
+            "toggle_news": "news_notifications",
+            "toggle_achievements": "achievement_notifications"
+        }
+        
+        setting_key = setting_map[data]
+        settings[setting_key] = not settings[setting_key]
+        self.update_notification_settings(user_id, settings)
+        
+        if setting_key == "weather_notifications" and settings[setting_key]:
+            self.check_achievements(user_id, "weather_enabled")
+        
+        self.handle_notifications_settings(chat_id, user_id)
+
+    def show_user_achievements(self, chat_id, user_id):
+        achievements = self.get_user_achievements(user_id)
+        
+        if not achievements:
+            self.send_message(chat_id, "🎯 У вас пока нет достижений. Продолжайте использовать бота!", self.achievements_keyboard())
+            return
+        
+        text = "🏆 <b>Ваши достижения</b>\n\n"
+        for name, description, icon, achieved_at in achievements:
+            date_str = self.format_date(achieved_at)
+            text += f"{icon} <b>{name}</b>\n{description}\n📅 {date_str}\n\n"
+        
+        self.send_message(chat_id, text, self.achievements_keyboard())
+
+    def show_achievement_progress(self, chat_id, user_id):
+        achievement_types = ["registration", "schedule_views", "total_actions", "good_grades", "news_read", "weather_enabled"]
+        text = "📊 <b>Ваш прогресс по достижениям</b>\n\n"
+        
+        for achievement_type in achievement_types:
+            progress = self.get_user_achievement_progress(user_id, achievement_type)
+            achievements = self.db.fetchall(
+                "SELECT name, condition_value FROM achievements WHERE condition_type = ?",
+                (achievement_type,)
+            )
+            
+            for name, condition_value in achievements:
+                percentage = min(100, int((progress / condition_value) * 100)) if condition_value > 0 else 100
+                progress_bar = "🟩" * (percentage // 20) + "⬜" * (5 - percentage // 20)
+                text += f"{name}: {progress}/{condition_value}\n{progress_bar} {percentage}%\n\n"
+        
+        self.send_message(chat_id, text, self.achievements_keyboard())
+
+    def show_recent_news(self, chat_id, user_id):
+        news = self.get_news(limit=5)
+        
+        if not news:
+            self.send_message(chat_id, "📰 Пока нет новостей.", self.news_keyboard())
+            return
+        
+        text = "📰 <b>Последние новости</b>\n\n"
+        for title, content, author, publish_date in news:
+            date_str = self.format_date(publish_date)
+            text += f"<b>{self.safe_message(title)}</b>\n"
+            text += f"{self.safe_message(content[:100])}...\n"
+            text += f"👤 {self.safe_message(author)} | 📅 {date_str}\n\n"
+            
+            self.log_user_activity(user_id, "news_read", f"News: {title}")
+        
+        self.send_message(chat_id, text, self.news_keyboard())
+
+    def show_news_statistics(self, chat_id, user_id):
+        total_news = self.db.fetchone("SELECT COUNT(*) FROM school_news WHERE is_published = TRUE")
+        total_news = total_news[0] if total_news else 0
+        
+        user_stats = self.get_user_statistics(user_id)
+        user_news_read = user_stats['news_read']
+        
+        percentage = (user_news_read / total_news * 100) if total_news > 0 else 0
+        
+        text = (f"📊 <b>Статистика новостей</b>\n\n"
+               f"📰 Всего новостей: {total_news}\n"
+               f"📖 Прочитано вами: {user_news_read}\n"
+               f"📈 Процент прочитанного: {percentage:.1f}%\n\n")
+        
+        if percentage >= 80:
+            text += "🎉 Вы отлично информированы!"
+        elif percentage >= 50:
+            text += "👍 Вы в курсе основных событий!"
+        else:
+            text += "💡 Читайте больше новостей, чтобы быть в курсе!"
+        
+        self.send_message(chat_id, text, self.news_keyboard())
+
+    def show_user_grades(self, chat_id, user_id):
+        grades = self.get_student_grades(user_id, limit=10)
+        
+        if not grades:
+            self.send_message(chat_id, "📊 У вас пока нет оценок.", self.diary_keyboard())
+            return
+        
+        text = "📊 <b>Ваши последние оценки</b>\n\n"
+        for subject, grade, grade_type, lesson_date, comment in grades:
+            date_str = self.format_date(lesson_date)
+            grade_emoji = "🟢" if grade >= 4 else "🟡" if grade == 3 else "🔴"
+            text += f"{grade_emoji} <b>{subject}</b>: {grade} ({grade_type})\n"
+            if comment:
+                text += f"💬 {comment}\n"
+            text += f"📅 {date_str}\n\n"
+        
+        self.send_message(chat_id, text, self.diary_keyboard())
+
+    def show_average_grades(self, chat_id, user_id):
+        overall_avg = self.get_student_average_grade(user_id)
+        
+        subjects = self.db.fetchall(
+            "SELECT DISTINCT subject FROM student_grades WHERE user_id = ?",
+            (user_id,)
+        )
+        
+        text = f"📈 <b>Средние баллы</b>\n\n"
+        text += f"📊 Общий средний балл: {overall_avg}\n\n"
+        
+        if subjects:
+            text += "<b>По предметам:</b>\n"
+            for subject_row in subjects:
+                subject = subject_row[0]
+                subject_avg = self.get_student_average_grade(user_id, subject)
+                text += f"• {subject}: {subject_avg}\n"
+        
+        self.send_message(chat_id, text, self.diary_keyboard())
+
+    def show_grades_by_subject(self, chat_id, user_id):
+        subjects = self.db.fetchall(
+            "SELECT DISTINCT subject FROM student_grades WHERE user_id = ? ORDER BY subject",
+            (user_id,)
+        )
+        
+        if not subjects:
+            self.send_message(chat_id, "📚 У вас пока нет оценок по предметам.", self.diary_keyboard())
+            return
+        
+        text = "📚 <b>Оценки по предметам</b>\n\n"
+        
+        for subject_row in subjects:
+            subject = subject_row[0]
+            grades = self.get_student_grades(user_id, subject, limit=5)
+            avg_grade = self.get_student_average_grade(user_id, subject)
+            
+            text += f"<b>{subject}</b> (средний: {avg_grade}):\n"
+            
+            grade_list = []
+            for _, grade, grade_type, lesson_date, _ in grades:
+                date_str = self.format_date(lesson_date)
+                grade_emoji = "🟢" if grade >= 4 else "🟡" if grade == 3 else "🔴"
+                grade_list.append(f"{grade_emoji} {grade} ({grade_type}) - {date_str}")
+            
+            text += ", ".join(grade_list) + "\n\n"
+        
+        self.send_message(chat_id, text, self.diary_keyboard())
+
+    def show_detailed_statistics(self, chat_id, user_id):
+        stats = self.get_user_statistics(user_id)
+        achievements = self.get_user_achievements(user_id)
+        user_data = self.get_user(user_id)
+        
+        role_data = self.get_user_role(user_id)
+        role_type, additional_info = role_data
+        
+        text = (f"📈 <b>Подробная статистика</b>\n\n"
+               f"👤 <b>Профиль</b>\n"
+               f"• Имя: {self.safe_message(user_data[1]) if user_data else 'Неизвестно'}\n"
+               f"• Класс: {self.safe_message(user_data[2]) if user_data else 'Неизвестно'}\n"
+               f"• Роль: {role_type}\n\n"
+               
+               f"📊 <b>Активность</b>\n"
+               f"• Всего действий: {stats['total_actions']}\n"
+               f"• Просмотров расписания: {stats['schedule_views']}\n"
+               f"• Прочитано новостей: {stats['news_read']}\n"
+               f"• Получено достижений: {len(achievements)}\n"
+               f"• Последняя активность: {self.format_date(stats['last_active']) if stats['last_active'] else 'неизвестно'}\n\n")
+        
+        if achievements:
+            text += "🏆 <b>Последние достижения</b>\n"
+            for name, _, icon, date in achievements[:3]:
+                text += f"{icon} {name} - {self.format_date(date)}\n"
+        
+        self.send_message(chat_id, text, self.statistics_keyboard())
+    
+    # СУЩЕСТВУЮЩИЕ МЕТОДЫ ОБРАБОТКИ
     def answer_callback_query(self, callback_query_id, text=None):
         url = f"{BASE_URL}/answerCallbackQuery"
         data = {"callback_query_id": callback_query_id}
@@ -1607,6 +2388,8 @@ class SimpleSchoolBot:
                 f"✅ Регистрация прошла успешно!\nФИО: {self.safe_message(full_name)}\nКласс: {class_name}",
                 self.main_menu_keyboard()
             )
+            self.log_user_activity(user_id, "registration")
+            self.check_achievements(user_id, "registration")
         else:
             self.send_message(
                 chat_id,
@@ -1715,6 +2498,9 @@ class SimpleSchoolBot:
                         elif state.get("action") == "select_shift":
                             self.handle_shift_selection(chat_id, username, text)
                             return
+                        elif state.get("action") == "role_registration":
+                            self.handle_role_registration_input(chat_id, user_id, username, text)
+                            return
                     
                     if text.startswith("/start"):
                         self.handle_start(chat_id, user)
@@ -1722,25 +2508,76 @@ class SimpleSchoolBot:
                         self.handle_help(chat_id, username)
                     elif text.startswith("/admin_panel"):
                         self.handle_admin_panel(chat_id, username)
-                    elif text in ["📚 Моё расписание", "🏫 Общее расписание", "🔔 Звонки", "ℹ️ Помощь"]:
+                    elif text in ["📚 Моё расписание", "🏫 Общее расписание", "🔔 Звонки", "📰 Новости", 
+                                "⚙️ Настройки", "🏆 Достижения", "📊 Дневник", "📈 Статистика", "ℹ️ Помощь"]:
                         self.handle_main_menu(chat_id, user_id, text, username)
                     elif text in ["👥 Список пользователей", "❌ Удалить пользователя", "📝 Редактировать расписание", 
                                   "🏫 Управление классами", "🕧 Управление звонками", "📤 Загрузить Excel", "📊 Статистика", "⬅️ Назад"]:
                         self.handle_admin_menu(chat_id, username, text)
                     elif text in ["1 смена", "2 смена"]:
                         self.handle_shift_selection(chat_id, username, text)
+                    elif text in ["👨‍🎓 Ученик", "👨‍🏫 Учитель", "👤 Гость"]:
+                        self.handle_role_registration(chat_id, user_id, text)
                     elif text == "⬅️ Назад" or self.is_valid_class(text):
                         self.handle_main_menu(chat_id, user_id, text, username)
                     else:
-                        self.handle_registration(chat_id, user_id, text)
+                        if user_id in self.user_states and self.user_states[user_id].get("action") == "role_registration":
+                            self.handle_role_registration_input(chat_id, user_id, username, text)
+                        else:
+                            self.handle_registration(chat_id, user_id, text)
         
         except Exception as e:
             logger.error(f"Ошибка в process_update: {e}")
             import traceback
             logger.error(traceback.format_exc())
     
+    def handle_role_registration_input(self, chat_id, user_id, username, text):
+        if user_id not in self.user_states or self.user_states[user_id].get("action") != "role_registration":
+            return
+        
+        role_type = self.user_states[user_id].get("role")
+        
+        if role_type == "guest":
+            if not self.is_valid_fullname(text):
+                self.send_message(chat_id, "❌ Неверный формат ФИО. Введите корректное ФИО:")
+                return
+            
+            if self.register_user_with_role(user_id, text, "Гость", "guest"):
+                self.send_message(chat_id, f"✅ Регистрация гостя прошла успешно!\nФИО: {self.safe_message(text)}", self.main_menu_keyboard())
+            else:
+                self.send_message(chat_id, "❌ Ошибка регистрации", self.main_menu_keyboard())
+        
+        else:
+            parts = text.split(',')
+            if len(parts) != 2:
+                self.send_message(chat_id, "❌ Неверный формат. Введите: Фамилия Имя Отчество, Класс")
+                return
+            
+            full_name = parts[0].strip()
+            class_name = parts[1].strip()
+            
+            if not self.is_valid_fullname(full_name):
+                self.send_message(chat_id, "❌ Неверный формат ФИО")
+                return
+            
+            if not self.is_valid_class(class_name):
+                self.send_message(chat_id, "❌ Неверный формат класса")
+                return
+            
+            class_name = class_name.upper()
+            additional_info = f"Учитель предмета" if role_type == "teacher" else None
+            
+            if self.register_user_with_role(user_id, full_name, class_name, role_type, additional_info):
+                role_text = "учителя" if role_type == "teacher" else "ученика"
+                self.send_message(chat_id, f"✅ Регистрация {role_text} прошла успешно!\nФИО: {self.safe_message(full_name)}\nКласс: {class_name}", self.main_menu_keyboard())
+            else:
+                self.send_message(chat_id, f"❌ Не удалось зарегистрироваться", self.main_menu_keyboard())
+        
+        if user_id in self.user_states:
+            del self.user_states[user_id]
+    
     def run(self):
-        logger.info("Бот запущен")
+        logger.info("Бот запущен с новыми функциями!")
         
         try:
             delete_url = f"{BASE_URL}/deleteWebhook"
